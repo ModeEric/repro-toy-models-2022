@@ -1,0 +1,16 @@
+# Spec §4.1 baseline: ReLU+L1 SAE, no focal reweighting.
+arch: relu
+expansion: 8
+model_name: EleutherAI/pythia-70m-deduped
+layer: 3
+site: resid_post
+dataset_name: NeelNanda/pile-10k
+seq_len: 128
+batch_size: 4096
+n_steps: 30000
+lr: 1.0e-3
+sparsity_coef: 1.0e-3
+focal_scheme: none
+focal_gamma: 0.0
+seed: 0
+out_dir: runs

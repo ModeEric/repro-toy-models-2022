@@ -1,0 +1,31 @@
+[project]
+name = "saetst"
+version = "0.1.0"
+description = "Focal-reweighted reconstruction loss for sparse autoencoders"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.4",
+    "transformer-lens>=2.0",
+    "datasets>=2.20",
+    "numpy>=1.26",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/saetst"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
