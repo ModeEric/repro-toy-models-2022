@@ -45,9 +45,13 @@ class TrainConfig:
     # Dead-latent detection
     dead_token_window: int = 200_000   # number of tokens for dead-latent stat
 
+    # Activation source. If `cache_dir` is set, training reads from a
+    # pre-built sharded cache (fast — no LM forward in the loop).
+    cache_dir: Optional[str] = None
+
     # Bookkeeping
     seed: int = 0
-    device: str = "auto"               # "auto" → mps if available else cpu
+    device: str = "auto"               # "auto" → cuda > mps > cpu (resolved at runtime)
     log_every: int = 100
     eval_every: int = 1000
     out_dir: str = "runs"

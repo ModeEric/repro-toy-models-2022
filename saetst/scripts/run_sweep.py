@@ -26,8 +26,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from saetst.config import TrainConfig
-from saetst.data import LMActivationStream, LMStreamConfig
+from saetst.data import CachedActivationStream, LMActivationStream, LMStreamConfig
 from saetst.train import train_sae
+from saetst.utils import resolve_device
 
 
 SWEEPS: dict[str, dict] = {
@@ -97,6 +98,10 @@ def main():
                    help=f"one of: all, {', '.join(SWEEPS)}")
     p.add_argument("--steps", type=int, default=10_000)
     p.add_argument("--seeds", type=int, default=1)
+    p.add_argument("--cache-dir", default=None,
+                   help="path to a sharded activation cache built by "
+                        "scripts/cache_activations.py; STRONGLY recommended "
+                        "for sweeps — amortizes the LM forward across all runs")
     p.add_argument("--dry-run", action="store_true",
                    help="just print the run plan and exit")
     args = p.parse_args()
@@ -109,21 +114,28 @@ def main():
                   f"gamma={cfg.focal_gamma} sparsity={cfg.sparsity_coef:.4g} seed={cfg.seed}")
         return
 
-    # One LM activation stream per arch/seed combo would be ideal, but the
-    # streaming buffer is shared per run anyway. For simplicity we build a
-    # fresh stream per run; this re-tokenizes from the start of the dataset.
     summary = []
     for i, cfg in enumerate(runs):
         print(f"\n[sweep] run {i+1}/{len(runs)}: {cfg.run_name}")
-        stream_cfg = LMStreamConfig(
-            model_name=cfg.model_name, layer=cfg.layer, site=cfg.site,
-            dataset_name=cfg.dataset_name, dataset_split=cfg.dataset_split,
-            text_field=cfg.text_field, seq_len=cfg.seq_len,
-            buffer_size=cfg.activations_per_shard, batch_size=cfg.batch_size,
-            device="cpu" if cfg.device == "auto" else cfg.device, seed=cfg.seed,
-        )
-        stream = LMActivationStream(stream_cfg)
-        result = train_sae(cfg, stream, d_in=stream.d_in)
+        if args.cache_dir:
+            cfg.cache_dir = args.cache_dir
+            stream = CachedActivationStream(
+                args.cache_dir, batch_size=cfg.batch_size,
+                shuffle=True, repeat=True, seed=cfg.seed,
+            )
+            d_in = stream.d_in
+        else:
+            compute_device = str(resolve_device(cfg.device))
+            stream_cfg = LMStreamConfig(
+                model_name=cfg.model_name, layer=cfg.layer, site=cfg.site,
+                dataset_name=cfg.dataset_name, dataset_split=cfg.dataset_split,
+                text_field=cfg.text_field, seq_len=cfg.seq_len,
+                buffer_size=cfg.activations_per_shard, batch_size=cfg.batch_size,
+                device=compute_device, seed=cfg.seed,
+            )
+            stream = LMActivationStream(stream_cfg)
+            d_in = stream.d_in
+        result = train_sae(cfg, stream, d_in=d_in)
         summary.append({
             "run_name": cfg.run_name,
             "out_dir": result["out_dir"],

@@ -25,9 +25,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from saetst.config import TrainConfig
-from saetst.data import LMActivationStream, LMStreamConfig
+from saetst.data import CachedActivationStream, LMActivationStream, LMStreamConfig
 from saetst.metrics import DeadLatentTracker, evaluate_recon, downstream_loss_recovered
 from saetst.models import make_sae
+from saetst.utils import resolve_device
 
 
 def load_sae(ckpt_path: Path):
@@ -44,14 +45,21 @@ def find_checkpoints(root: Path) -> list[Path]:
     return sorted(root.rglob("checkpoint.pt"))
 
 
-def stream_factory(cfg: TrainConfig, seed: int):
+def stream_factory(cfg: TrainConfig, seed: int, cache_override: str | None = None):
+    cache_dir = cache_override or cfg.cache_dir
     def make():
+        if cache_dir:
+            return CachedActivationStream(
+                cache_dir, batch_size=cfg.batch_size, shuffle=True,
+                repeat=False, seed=seed,
+            )
+        compute_device = str(resolve_device(cfg.device))
         sc = LMStreamConfig(
             model_name=cfg.model_name, layer=cfg.layer, site=cfg.site,
             dataset_name=cfg.dataset_name, dataset_split=cfg.dataset_split,
             text_field=cfg.text_field, seq_len=cfg.seq_len,
             buffer_size=cfg.activations_per_shard, batch_size=cfg.batch_size,
-            device="cpu", seed=seed,
+            device=compute_device, seed=seed,
         )
         return LMActivationStream(sc)
     return make
@@ -62,9 +70,10 @@ def evaluate_checkpoint(
     eval_batches: int,
     dead_batches: int,
     downstream_texts: list[str] | None,
+    cache_override: str | None = None,
 ) -> dict:
     sae, cfg, d_in = load_sae(ckpt)
-    factory = stream_factory(cfg, seed=cfg.seed + 9999)
+    factory = stream_factory(cfg, seed=cfg.seed + 9999, cache_override=cache_override)
 
     # Recon stats
     eval_stream = factory()
@@ -132,6 +141,9 @@ def main():
                    help="skip the downstream loss-recovered metric (slow without GPU)")
     p.add_argument("--downstream-n", type=int, default=8,
                    help="number of held-out texts for downstream eval")
+    p.add_argument("--cache-dir", default=None,
+                   help="use this activation cache for recon/dead metrics "
+                        "(falls back to each checkpoint's training-time source)")
     args = p.parse_args()
 
     if args.sweep == "all":
@@ -158,7 +170,10 @@ def main():
         print(f"[eval] {root}: {len(ckpts)} checkpoints")
         for c in ckpts:
             print(f"  evaluating {c}")
-            m = evaluate_checkpoint(c, args.eval_batches, args.dead_batches, downstream_texts)
+            m = evaluate_checkpoint(
+                c, args.eval_batches, args.dead_batches, downstream_texts,
+                cache_override=args.cache_dir,
+            )
             all_metrics.append(m)
 
         out = root / "metrics.json"

@@ -22,16 +22,11 @@ from saetst.config import TrainConfig
 from saetst.losses import FocalReweighter, sae_loss
 from saetst.metrics import DeadLatentTracker
 from saetst.models import make_sae
+from saetst.utils import resolve_device
 
 
-def _resolve_device(name: str) -> torch.device:
-    if name == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(name)
+# Re-exported for backwards compat.
+_resolve_device = resolve_device
 
 
 def _lr_at(step: int, base_lr: float, warmup: int, total: int) -> float:
@@ -66,7 +61,7 @@ def train_sae(
         `metrics` (training history list), and `final` (last log dict).
     """
     torch.manual_seed(cfg.seed)
-    device = _resolve_device(cfg.device)
+    device = resolve_device(cfg.device)
 
     sae = make_sae(cfg.arch, d_in=d_in, n_latents=d_in * cfg.expansion, device=device)
     sae.train()

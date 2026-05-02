@@ -1,26 +1,34 @@
 """Activation streaming.
 
 `ActivationStream` is a generic iterator that yields batches of activation
-vectors of shape `[batch, d_in]`. Two implementations:
+vectors of shape `[batch, d_in]`. Three implementations:
 
   * `LMActivationStream` — runs a TransformerLens HookedTransformer on text
     from a HuggingFace dataset, captures activations from a chosen layer/site,
     and shuffles them in a small replay buffer so consecutive minibatches
-    aren't all from the same document.
+    aren't all from the same document. Use for ad-hoc / single runs.
+
+  * `CachedActivationStream` — reads pre-dumped activations from a sharded
+    fp16 binary cache on disk (built by `scripts/cache_activations.py`). Use
+    for sweeps: amortize the LM forward across all runs and keep the GPU
+    100 % bound on SAE training.
 
   * `SyntheticActivationStream` — sparse-coded synthetic data with a fixed
     ground-truth dictionary. Used for unit tests, smoke runs, and offline
     development when network access isn't available.
 
-The two share the same `iter(...) -> Iterator[Tensor]` interface so the trainer
-doesn't care which is in use.
+All three share the same `iter(...) -> Iterator[Tensor]` interface so the
+trainer doesn't care which is in use.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator, Optional
 
+import numpy as np
 import torch
 
 
@@ -112,8 +120,9 @@ class LMStreamConfig:
     buffer_size: int = 16384       # how many activation vectors to hold for shuffling
     refill_threshold: float = 0.5  # when buffer drops below this fraction, refill
     batch_size: int = 4096
-    n_seqs_per_refill: int = 64
+    n_seqs_per_refill: int = 256   # sized for A100 (~64k tokens / refill in fp32)
     device: str = "cpu"
+    dtype: str = "auto"            # "auto" → bf16 on cuda, fp32 elsewhere
     seed: int = 0
 
 
@@ -133,6 +142,7 @@ class LMActivationStream:
         # Local imports — heavy and only needed for this path.
         from transformer_lens import HookedTransformer  # noqa: WPS433
         from datasets import load_dataset  # noqa: WPS433
+        from saetst.utils import default_lm_dtype  # noqa: WPS433
 
         self.cfg = cfg
         torch.manual_seed(cfg.seed)
@@ -140,6 +150,13 @@ class LMActivationStream:
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
+        # bf16 on cuda saves ~2× LM forward time; activations get cast back to fp32
+        # before the SAE consumes them (SAE is small enough that fp32 is fine).
+        if cfg.dtype == "auto":
+            self.lm_dtype = default_lm_dtype(cfg.device)
+        else:
+            self.lm_dtype = getattr(torch, cfg.dtype)
+        self.model = self.model.to(self.lm_dtype)
         self.d_in = self.model.cfg.d_model
         self.hook_name = f"blocks.{cfg.layer}.hook_{cfg.site}"
 
@@ -192,7 +209,7 @@ class LMActivationStream:
         # Drop padded positions and the BOS token (first position carries no useful signal here).
         valid = attention_mask.clone()
         valid[:, 0] = False
-        flat = acts[valid]               # [n_valid_tokens, d_in]
+        flat = acts[valid].float()       # [n_valid_tokens, d_in], cast to fp32 for SAE
         if flat.numel() == 0:
             return
 
@@ -232,3 +249,108 @@ class LMActivationStream:
         batch = self._buffer[:bs]
         self._buffer = self._buffer[bs:]
         return batch
+
+
+# -----------------------------------------------------------------------------
+# Cached activations on disk — for sweeps. Built by scripts/cache_activations.py.
+# -----------------------------------------------------------------------------
+
+
+CACHE_META = "meta.json"
+
+
+def _shard_path(cache_dir: Path, idx: int) -> Path:
+    return cache_dir / f"shard_{idx:04d}.bin"
+
+
+class CachedActivationStream:
+    """Iterate batches over a sharded fp16 activation cache on disk.
+
+    Cache format (written by `scripts/cache_activations.py`):
+        cache_dir/meta.json     — {d_in, n_per_shard, n_shards, dtype, ...}
+        cache_dir/shard_NNNN.bin — raw bytes, [n_per_shard, d_in], dtype as in meta
+
+    Each call to `__next__` returns a `[batch_size, d_in]` fp32 tensor on CPU
+    (move to device in the trainer). When `repeat=True`, the stream cycles
+    forever, reshuffling the shard order each epoch.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        *,
+        batch_size: int,
+        shuffle: bool = True,
+        repeat: bool = True,
+        seed: int = 0,
+    ):
+        self.cache_dir = Path(cache_dir)
+        meta_path = self.cache_dir / CACHE_META
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"no cache at {self.cache_dir} (missing {CACHE_META}). "
+                f"build one with `python scripts/cache_activations.py ...`"
+            )
+        with open(meta_path) as f:
+            self.meta = json.load(f)
+        self.d_in = int(self.meta["d_in"])
+        self.n_per_shard = int(self.meta["n_per_shard"])
+        self.n_shards = int(self.meta["n_shards"])
+        self.dtype = np.dtype(self.meta["dtype"])
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.repeat = bool(repeat)
+        self._rng = np.random.default_rng(seed)
+        self._reset_epoch()
+
+    @property
+    def n_total(self) -> int:
+        return self.n_shards * self.n_per_shard
+
+    def _reset_epoch(self) -> None:
+        self._shard_order = list(range(self.n_shards))
+        if self.shuffle:
+            self._rng.shuffle(self._shard_order)
+        self._next_shard = 0
+        self._buffer: Optional[np.ndarray] = None
+        self._cursor = 0
+
+    def _load_next_shard(self) -> bool:
+        """Load the next shard into RAM (shuffled). Returns True iff one was loaded."""
+        if self._next_shard >= len(self._shard_order):
+            return False
+        shard_idx = self._shard_order[self._next_shard]
+        path = _shard_path(self.cache_dir, shard_idx)
+        # Memmap → np.array forces a single sequential read off disk; faster than
+        # random-indexing a memmap when we then shuffle the whole shard.
+        mm = np.memmap(path, dtype=self.dtype, mode="r")
+        arr = np.array(mm.reshape(-1, self.d_in))
+        del mm
+        if self.shuffle:
+            idx = self._rng.permutation(len(arr))
+            arr = arr[idx]
+        self._buffer = arr
+        self._cursor = 0
+        self._next_shard += 1
+        return True
+
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        return self
+
+    def __next__(self) -> torch.Tensor:
+        bs = self.batch_size
+        while True:
+            # Need a new shard?
+            if self._buffer is None or self._cursor + bs > len(self._buffer):
+                # Drop the partial tail of the current shard (max bs-1 tokens, negligible).
+                loaded = self._load_next_shard()
+                if not loaded:
+                    if self.repeat:
+                        self._reset_epoch()
+                        continue
+                    raise StopIteration
+                continue
+            batch = self._buffer[self._cursor : self._cursor + bs]
+            self._cursor += bs
+            # Convert fp16 → fp32 for the SAE; keep on CPU (trainer moves to device).
+            return torch.from_numpy(batch.astype(np.float32, copy=False))

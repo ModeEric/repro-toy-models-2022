@@ -18,8 +18,14 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from saetst.config import TrainConfig
-from saetst.data import LMActivationStream, LMStreamConfig, SyntheticActivationStream
+from saetst.data import (
+    CachedActivationStream,
+    LMActivationStream,
+    LMStreamConfig,
+    SyntheticActivationStream,
+)
 from saetst.train import train_sae
+from saetst.utils import resolve_device
 
 
 def parse_overrides(items: list[str]) -> dict:
@@ -50,6 +56,9 @@ def main():
     p.add_argument("--synthetic", action="store_true",
                    help="use synthetic activations instead of LM (for testing)")
     p.add_argument("--synthetic-d-in", type=int, default=64)
+    p.add_argument("--cache-dir", default=None,
+                   help="path to a CachedActivationStream cache "
+                        "(overrides config.cache_dir; skips the LM entirely)")
     args = p.parse_args()
 
     with open(args.config) as f:
@@ -64,8 +73,16 @@ def main():
     cfg = TrainConfig(**raw)
     if cfg.run_name is None:
         cfg.run_name = Path(args.config).stem
+    if args.cache_dir is not None:
+        cfg.cache_dir = args.cache_dir
+
+    # Resolve "auto" to the actual compute device once, here, so the LM and
+    # the SAE end up on the same accelerator (the previous version pinned
+    # the LM to CPU, which made GPU runs LM-bound and ~50× slower).
+    compute_device = str(resolve_device(cfg.device))
 
     print(f"[train_sae] config: {cfg}")
+    print(f"[train_sae] compute device: {compute_device}")
 
     if args.synthetic:
         d_in = args.synthetic_d_in
@@ -75,8 +92,18 @@ def main():
             k=8,
             batch_size=cfg.batch_size,
             seed=cfg.seed,
-            device=cfg.device if cfg.device != "auto" else "cpu",
+            device="cpu",   # synthetic gen is cheap; SAE moves to compute_device
         )
+    elif cfg.cache_dir:
+        print(f"[train_sae] reading activations from cache: {cfg.cache_dir}")
+        stream = CachedActivationStream(
+            cfg.cache_dir,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            repeat=True,
+            seed=cfg.seed,
+        )
+        d_in = stream.d_in
     else:
         stream_cfg = LMStreamConfig(
             model_name=cfg.model_name,
@@ -88,7 +115,7 @@ def main():
             seq_len=cfg.seq_len,
             buffer_size=cfg.activations_per_shard,
             batch_size=cfg.batch_size,
-            device="cpu" if cfg.device == "auto" else cfg.device,
+            device=compute_device,
             seed=cfg.seed,
         )
         stream = LMActivationStream(stream_cfg)
