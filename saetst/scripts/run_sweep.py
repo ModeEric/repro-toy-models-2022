@@ -114,6 +114,20 @@ def main():
                   f"gamma={cfg.focal_gamma} sparsity={cfg.sparsity_coef:.4g} seed={cfg.seed}")
         return
 
+    if args.cache_dir is None:
+        print("[sweep] WARNING: --cache-dir not provided. Each run will spin up "
+              "the LM live and re-tokenize the dataset from scratch. For a real "
+              "sweep, build a cache once with scripts/cache_activations.py and "
+              "pass --cache-dir; you'll typically save 10-50x wall time.")
+    else:
+        from saetst.data import CACHE_META  # noqa: WPS433
+        meta = Path(args.cache_dir) / CACHE_META
+        if not meta.exists():
+            raise SystemExit(
+                f"[sweep] --cache-dir={args.cache_dir} has no {CACHE_META}; "
+                f"build the cache first with scripts/cache_activations.py"
+            )
+
     summary = []
     for i, cfg in enumerate(runs):
         print(f"\n[sweep] run {i+1}/{len(runs)}: {cfg.run_name}")

@@ -31,12 +31,13 @@ from saetst.models import make_sae
 from saetst.utils import resolve_device
 
 
-def load_sae(ckpt_path: Path):
+def load_sae(ckpt_path: Path, device: torch.device | str = "cpu"):
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = TrainConfig(**blob["cfg"])
     d_in = blob["d_in"]
     sae = make_sae(cfg.arch, d_in=d_in, n_latents=d_in * cfg.expansion)
     sae.load_state_dict(blob["sae"])
+    sae = sae.to(device)
     sae.eval()
     return sae, cfg, d_in
 
@@ -71,20 +72,21 @@ def evaluate_checkpoint(
     dead_batches: int,
     downstream_texts: list[str] | None,
     cache_override: str | None = None,
+    device: str = "cpu",
 ) -> dict:
-    sae, cfg, d_in = load_sae(ckpt)
+    sae, cfg, d_in = load_sae(ckpt, device=device)
     factory = stream_factory(cfg, seed=cfg.seed + 9999, cache_override=cache_override)
 
     # Recon stats
     eval_stream = factory()
-    recon = evaluate_recon(sae, eval_stream, n_batches=eval_batches, device="cpu")
+    recon = evaluate_recon(sae, eval_stream, n_batches=eval_batches, device=device)
 
     # Dead latents over a long window
     dead_stream = factory()
     tracker = DeadLatentTracker(
         n_latents=sae.n_latents,
         window_tokens=cfg.dead_token_window,
-        device="cpu",
+        device=device,
     )
     seen = 0
     for _ in range(dead_batches):
@@ -92,6 +94,8 @@ def evaluate_checkpoint(
             x = next(dead_stream)
         except StopIteration:
             break
+        # Streams may be on cpu (cache) or cuda (live LM); SAE is on `device`.
+        x = x.to(device)
         with torch.no_grad():
             out = sae(x)
         tracker.update(out.z)
@@ -116,13 +120,13 @@ def evaluate_checkpoint(
 
     if downstream_texts:
         from transformer_lens import HookedTransformer  # noqa: WPS433
-        model = HookedTransformer.from_pretrained(cfg.model_name, device="cpu")
+        model = HookedTransformer.from_pretrained(cfg.model_name, device=device)
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
         hook_name = f"blocks.{cfg.layer}.hook_{cfg.site}"
         ds_metrics = downstream_loss_recovered(
-            sae, model, hook_name, downstream_texts, device="cpu",
+            sae, model, hook_name, downstream_texts, device=device,
         )
         metrics["downstream"] = ds_metrics
 
@@ -144,7 +148,11 @@ def main():
     p.add_argument("--cache-dir", default=None,
                    help="use this activation cache for recon/dead metrics "
                         "(falls back to each checkpoint's training-time source)")
+    p.add_argument("--device", default="auto",
+                   help="auto | cpu | cuda | mps")
     args = p.parse_args()
+    device = str(resolve_device(args.device))
+    print(f"[eval] device: {device}")
 
     if args.sweep == "all":
         roots = [Path("runs") / d.name for d in Path("runs").iterdir() if d.is_dir()]
@@ -173,6 +181,7 @@ def main():
             m = evaluate_checkpoint(
                 c, args.eval_batches, args.dead_batches, downstream_texts,
                 cache_override=args.cache_dir,
+                device=device,
             )
             all_metrics.append(m)
 
